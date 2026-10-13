@@ -3,6 +3,7 @@ package com.local.ktv
 import android.database.Cursor
 import android.database.sqlite.SQLiteDatabase
 import android.util.Log
+import com.github.houbb.opencc4j.util.ZhTwConverterUtil
 import java.io.File
 import java.util.Locale
 
@@ -480,20 +481,36 @@ class MuseDatabase @JvmOverloads constructor(initialSourceFile: File? = null) {
         columns: List<String>,
         args: MutableList<String>,
     ): String {
-        val latinQuery = query.all { it.code < 128 }
-        return if (latinQuery) {
-            val pattern = query.uppercase(Locale.ROOT).replace("[", "[[]") + "*"
-            repeat(columns.size) { args += pattern }
-            columns.joinToString(prefix = "(", postfix = ")", separator = " OR ") {
-                "$tableAlias$it GLOB ?"
-            }
-        } else {
-            val pattern = "%$query%"
-            repeat(columns.size) { args += pattern }
-            columns.joinToString(prefix = "(", postfix = ")", separator = " OR ") {
-                "$tableAlias$it LIKE ?"
+        // Search both the user's spelling and Taiwan-style Traditional/Simplified variants.
+        // Original database values are never rewritten; all generated SQL remains parameterized.
+        val variants = linkedSetOf(query)
+        runCatching { ZhTwConverterUtil.toTraditional(query) }
+            .getOrNull()
+            ?.takeIf(String::isNotBlank)
+            ?.let(variants::add)
+        runCatching { ZhTwConverterUtil.toSimple(query) }
+            .getOrNull()
+            ?.takeIf(String::isNotBlank)
+            ?.let(variants::add)
+
+        val conditions = ArrayList<String>(variants.size * columns.size)
+        variants.forEach { variant ->
+            val latinQuery = variant.all { it.code < 128 }
+            if (latinQuery) {
+                val pattern = variant.uppercase(Locale.ROOT).replace("[", "[[]") + "*"
+                columns.forEach { column ->
+                    args += pattern
+                    conditions += "$tableAlias$column GLOB ?"
+                }
+            } else {
+                val pattern = "%$variant%"
+                columns.forEach { column ->
+                    args += pattern
+                    conditions += "$tableAlias$column LIKE ?"
+                }
             }
         }
+        return conditions.joinToString(prefix = "(", postfix = ")", separator = " OR ")
     }
 
     companion object {
