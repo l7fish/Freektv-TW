@@ -21,10 +21,25 @@ object DatabaseBootstrapper {
         val sourceManifestUrl = manifestUrl
         require(sourceManifestUrl.isNotBlank()) { "Gitee database URL is not configured" }
         val manifest = JSONObject(readText(sourceManifestUrl))
-        val expectedSize = manifest.getLong("size")
-        val expectedSha256 = manifest.getString("sha256")
-        val chunksJson = manifest.getJSONArray("chunks")
+        val chunksJson = manifest.optJSONArray("chunks")
+            ?: throw IllegalArgumentException("database manifest has no chunks")
         require(chunksJson.length() > 0) { "database manifest has no chunks" }
+
+        // Some published manifests omit the aggregate "size" field but include
+        // each chunk's byte size. Derive the total instead of failing with
+        // JSONObject's opaque "No value for size" exception.
+        val declaredChunkSizes = (0 until chunksJson.length()).map { index ->
+            chunksJson.getJSONObject(index).optLong("size", -1L)
+        }
+        val expectedSize = manifest.optLong("size", -1L).takeIf { it > 0L }
+            ?: declaredChunkSizes.takeIf { sizes -> sizes.all { it >= 0L } }?.sum()
+            ?: throw IllegalArgumentException(
+                "database manifest is missing size and valid per-chunk sizes"
+            )
+        val expectedSha256 = manifest.optString("sha256", "").trim()
+        require(expectedSha256.matches(Regex("(?i)[0-9a-f]{64}"))) {
+            "database manifest is missing a valid SHA-256 checksum"
+        }
 
         val target = MuseDatabase.defaultDbFile()
         val temporary = File(target.parentFile, "${target.name}.download")
@@ -35,7 +50,10 @@ object DatabaseBootstrapper {
         check(partsDir.mkdirs()) { "cannot create database parts directory" }
 
         val urls = List(chunksJson.length()) { index ->
-            resolveUrl(sourceManifestUrl, chunksJson.getJSONObject(index).getString("url"))
+            val chunk = chunksJson.getJSONObject(index)
+            val chunkUrl = chunk.optString("url", "").trim()
+            require(chunkUrl.isNotEmpty()) { "database manifest chunk $index has no URL" }
+            resolveUrl(sourceManifestUrl, chunkUrl)
         }
         val written = AtomicLong(0L)
         val lastProgress = AtomicInteger(-1)
